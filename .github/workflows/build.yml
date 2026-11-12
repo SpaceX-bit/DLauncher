@@ -18,16 +18,18 @@ jobs:
         with:
           node-version: 20
 
-      - name: Unpack project from DLauncher.zip if needed
+      - name: Unpack project from zip if needed
         shell: pwsh
         run: |
-          if (-not (Test-Path package.json) -and (Test-Path DLauncher.zip)) {
-            Expand-Archive -Path DLauncher.zip -DestinationPath _unz -Force
+          $zip = Get-ChildItem -Filter *.zip | Select-Object -First 1
+          if (-not (Test-Path package.json) -and $zip) {
+            Write-Host "Unpacking $($zip.Name)"
+            Expand-Archive -LiteralPath $zip.FullName -DestinationPath _unz -Force
             $found = Get-ChildItem _unz -Recurse -Filter package.json | Where-Object { $_.FullName -notmatch 'node_modules' } | Select-Object -First 1
             if ($found) { Copy-Item -Path (Join-Path $found.DirectoryName '*') -Destination . -Recurse -Force }
           }
           if (-not (Test-Path package.json)) {
-            Write-Host 'package.json not found: upload the project files or DLauncher.zip to the repository root'
+            Write-Host 'package.json not found: upload the project files or the project .zip to the repository root'
             exit 1
           }
           Get-ChildItem | Select-Object -ExpandProperty Name
