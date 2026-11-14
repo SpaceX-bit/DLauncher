@@ -18,20 +18,31 @@ jobs:
         with:
           node-version: 20
 
-      - name: Unpack project from DLauncher.zip if needed
+      - name: Unpack project from zip
         shell: pwsh
         run: |
-          $zip = Get-ChildItem -Filter *.zip | Select-Object -First 1
-          if (-not (Test-Path package.json) -and $zip) {
-            Write-Host "Unpacking $($zip.Name)"
-            Expand-Archive -LiteralPath $zip.FullName -DestinationPath _unz -Force
-            $found = Get-ChildItem _unz -Recurse -Filter package.json | Where-Object { $_.FullName -notmatch 'node_modules' } | Select-Object -First 1
-            if ($found) { Copy-Item -Path (Join-Path $found.DirectoryName '*') -Destination . -Recurse -Force }
+          $best = $null
+          foreach ($z in Get-ChildItem -Filter *.zip) {
+            $d = Join-Path '_unz' $z.BaseName
+            Expand-Archive -LiteralPath $z.FullName -DestinationPath $d -Force
+            $pj = Get-ChildItem $d -Recurse -Filter package.json | Where-Object { $_.FullName -notmatch 'node_modules' } | Select-Object -First 1
+            if ($pj) {
+              $v = [version]((Get-Content $pj.FullName -Raw | ConvertFrom-Json).version)
+              Write-Host "Found $($z.Name): version $v"
+              if (-not $best -or $v -gt $best.v) { $best = @{ v = $v; dir = $pj.DirectoryName } }
+            }
           }
-          if (-not (Test-Path package.json)) {
-            Write-Host 'package.json not found: upload the project files or the project .zip to the repository root'
+          if (-not $best) {
+            Write-Host '=== ERROR: no project .zip with package.json found in the repository root. Upload the DLauncher zip (v1.7.2) to the repo root. ==='
+            Get-ChildItem | Select-Object -ExpandProperty Name
             exit 1
           }
+          Write-Host "Using project version $($best.v)"
+          Get-ChildItem -Force | Where-Object { $_.Name -notin @('.git', '.github', '_unz') -and $_.Extension -ne '.zip' } | Remove-Item -Recurse -Force
+          Copy-Item -Path (Join-Path $best.dir '*') -Destination . -Recurse -Force
+          $final = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Write-Host "=== BUILDING DLauncher version $final ==="
+          if ([version]$final -ne $best.v) { Write-Host 'ERROR: version mismatch after copy'; exit 1 }
           Get-ChildItem | Select-Object -ExpandProperty Name
 
       - name: Set update repository
@@ -61,7 +72,6 @@ jobs:
           name: DLauncher-windows
           path: |
             dist/*-nsis.exe
-            dist/*-portable.exe
             dist/*.blockmap
             dist/latest.yml
 
@@ -71,6 +81,5 @@ jobs:
         with:
           files: |
             dist/*-nsis.exe
-            dist/*-portable.exe
             dist/*.blockmap
             dist/latest.yml
