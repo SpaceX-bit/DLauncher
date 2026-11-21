@@ -73,7 +73,15 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
           DLAUNCHER_DATA: ${{ runner.temp }}\dl-selftest
+          DLAUNCHER_SHOTS: shots
         run: python main.py --selftest
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DLauncher-screenshots
+          path: shots/*.png
+          if-no-files-found: ignore
 
       - name: Build app (PyInstaller)
         run: pyinstaller packaging/DLauncher.spec --noconfirm
