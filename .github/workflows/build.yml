@@ -14,9 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-python@v5
         with:
-          node-version: 20
+          python-version: '3.12'
+          architecture: x64
 
       - name: Unpack project from zip
         shell: pwsh
@@ -25,61 +26,85 @@ jobs:
           foreach ($z in Get-ChildItem -Filter *.zip) {
             $d = Join-Path '_unz' $z.BaseName
             Expand-Archive -LiteralPath $z.FullName -DestinationPath $d -Force
-            $pj = Get-ChildItem $d -Recurse -Filter package.json | Where-Object { $_.FullName -notmatch 'node_modules' } | Select-Object -First 1
-            if ($pj) {
-              $v = [version]((Get-Content $pj.FullName -Raw | ConvertFrom-Json).version)
+            $init = Get-ChildItem $d -Recurse -Filter __init__.py | Where-Object { $_.Directory.Name -eq 'dlauncher' -and (Test-Path (Join-Path $_.Directory.Parent.FullName 'main.py')) } | Select-Object -First 1
+            if ($init) {
+              $m = Select-String -Path $init.FullName -Pattern '__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
+              $v = [version]$m.Matches[0].Groups[1].Value
               Write-Host "Found $($z.Name): version $v"
-              if (-not $best -or $v -gt $best.v) { $best = @{ v = $v; dir = $pj.DirectoryName } }
+              if (-not $best -or $v -gt $best.v) { $best = @{ v = $v; dir = $init.Directory.Parent.FullName } }
             }
           }
           if (-not $best) {
-            Write-Host '=== ERROR: no project .zip with package.json found in the repository root. Upload the DLauncher zip (v1.7.2) to the repo root. ==='
+            Write-Host '=== ERROR: no DLauncher (Python) project .zip found in the repository root. Upload the project zip to the repo root. ==='
             Get-ChildItem | Select-Object -ExpandProperty Name
             exit 1
           }
           Write-Host "Using project version $($best.v)"
           Get-ChildItem -Force | Where-Object { $_.Name -notin @('.git', '.github', '_unz') -and $_.Extension -ne '.zip' } | Remove-Item -Recurse -Force
           Copy-Item -Path (Join-Path $best.dir '*') -Destination . -Recurse -Force
-          $final = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          Write-Host "=== BUILDING DLauncher version $final ==="
-          if ([version]$final -ne $best.v) { Write-Host 'ERROR: version mismatch after copy'; exit 1 }
           Get-ChildItem | Select-Object -ExpandProperty Name
+          $ver = (Select-String -Path dlauncher/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "=== BUILDING DLauncher version $ver ==="
+          "APP_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Set update repository
-        shell: bash
+        shell: python
         env:
           REPO: ${{ github.repository }}
         run: |
-          node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync('update-config.json','utf8'));if(!c.repo){c.repo=process.env.REPO;fs.writeFileSync('update-config.json',JSON.stringify(c,null,2)+'\n');}console.log('update repo:',c.repo)"
+          import json, os
+          c = json.load(open('update-config.json', encoding='utf-8'))
+          if not c.get('repo'):
+              c['repo'] = os.environ['REPO']
+              json.dump(c, open('update-config.json', 'w', encoding='utf-8'), indent=2)
+          print('update repo:', c['repo'])
 
-      - run: npm install
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller==6.11.1 pytest
 
-      - name: Build
+      - name: Unit tests (core)
+        continue-on-error: true
+        run: python -m pytest -q tests/test_base.py tests/test_launch.py tests/test_mods.py tests/test_modsmgr.py
+
+      - name: Interface self-test
         shell: pwsh
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          QT_QPA_PLATFORM: offscreen
+          DLAUNCHER_DATA: ${{ runner.temp }}\dl-selftest
+        run: python main.py --selftest
+
+      - name: Build app (PyInstaller)
+        run: pyinstaller packaging/DLauncher.spec --noconfirm
+
+      - name: Self-test of the built app
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          DLAUNCHER_DATA: ${{ runner.temp }}\dl-selftest2
         run: |
-          npm run build
-          if ($LASTEXITCODE -ne 0 -and (Test-Path build/installer.nsh)) {
-            Write-Host 'Build failed, retrying with the standard installer wizard'
-            Rename-Item build/installer.nsh installer.nsh.off
-            npm run build
-          }
+          $p = Start-Process -FilePath dist\DLauncher\DLauncher.exe -ArgumentList '--selftest' -Wait -PassThru
+          Write-Host "exit code: $($p.ExitCode)"
+          if (Test-Path "$env:DLAUNCHER_DATA\launcher.log") { Get-Content "$env:DLAUNCHER_DATA\launcher.log" -Tail 40 }
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          & $iscc "/DAppVersion=$env:APP_VERSION" packaging\installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist\*.exe
 
       - uses: actions/upload-artifact@v4
         with:
           name: DLauncher-windows
-          path: |
-            dist/*-nsis.exe
-            dist/*.blockmap
-            dist/latest.yml
+          path: dist/DLauncher-Setup-*.exe
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*-nsis.exe
-            dist/*.blockmap
-            dist/latest.yml
+          files: dist/DLauncher-Setup-*.exe
