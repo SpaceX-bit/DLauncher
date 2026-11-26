@@ -1,409 +1,265 @@
-"""Моды / ресурспаки / шейдеры: поиск, версии, установка (Modrinth + CurseForge), иконки, оптимизация.
-
-Порт main.js (блок «Моды…»). Обработчики: mods:search, mods:versions, mods:install, icon:get, opt:list, opt:install.
-"""
+"""Вкладка «Моды»: поиск и установка модов, ресурспаков, шейдеров и сборок (Modrinth / CurseForge)."""
 from __future__ import annotations
 
-import hashlib
-import json
-import os
-import re
-import urllib.parse
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
 
-from . import util
+from .. import i18n
+from ..dialogs.shared import KIND_LABEL, Segment, fmt_num
+from ..widgets import Card, RemoteIcon, VScroll, button, label
+from ._profile_util import loader_name, profile_label
 
-CF_LOADER = {"forge": 1, "fabric": 4, "quilt": 5, "neoforge": 6}
-CF_CLASS = {"mod": 6, "resourcepack": 12, "shader": 6552, "modpack": 4471}
-KIND_DIR = {"mod": "mods", "resourcepack": "resourcepacks", "shader": "shaderpacks"}
-CF_BASE = "https://api.curseforge.com/v1"
-MR_BASE = "https://api.modrinth.com/v2"
-NEED_KEY = "Для CurseForge нужен API-ключ: вставь его в Настройках (console.curseforge.com)."
-NEED_PROFILE = "Сначала создай профиль (вкладка «Профили»)."
+i18n.register({
+    "Моды": "Mods",
+    "Сборки": "Modpacks",
+    "Ресурспаки": "Resource packs",
+    "Шейдеры": "Shaders",
+    "Поиск...": "Search...",
+    "Тип": "Type",
+    "Источник": "Source",
+    "Подбор под профиль": "Matched to profile",
+    "Показываются только моды под версию игры и загрузчик выбранного профиля.": "Only mods for the game version and loader of the selected profile are shown.",
+    "Найти": "Search",
+    "Установить": "Install",
+    "Версии": "Versions",
+    "Ещё": "More",
+    "Оптимизация": "Optimize",
+    "Ищу...": "Searching...",
+    "Ничего не найдено": "Nothing found",
+    "Профиль: {p}": "Profile: {p}",
+    "Сначала создай профиль на вкладке «Профили».": "Create a profile on the Profiles tab first.",
+    "Установлено: {f}": "Installed: {f}",
+    "Установлено: {f} (+{n} зависимостей)": "Installed: {f} (+{n} dependencies)",
+    "{n} загрузок": "{n} downloads",
+    "Установка сборки...": "Installing modpack...",
+    "Сборка установлена: профиль «{n}»": "Modpack installed: profile “{n}”",
+})
 
-
-class NoVersion(Exception):
-    code = "NO_VERSION"
-
-
-def enc(x) -> str:
-    return urllib.parse.quote(json.dumps(x, separators=(",", ":"), ensure_ascii=False), safe="")
-
-
-def q(s) -> str:
-    return urllib.parse.quote(str(s), safe="")
-
-
-def ok_project_id(x) -> bool:
-    return isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", x) is not None
-
-
-def ok_cf_number(x) -> bool:
-    try:
-        f = float(x)
-    except (TypeError, ValueError):
-        return False
-    return f == int(f) and 0 < f < 1e10
+KINDS = [("mod", "Моды"), ("modpack", "Сборки"), ("resourcepack", "Ресурспаки"), ("shader", "Шейдеры")]
 
 
-def mc_summary(lst: list) -> str:
-    return ", ".join(lst) if len(lst) <= 3 else f"{lst[0]} … {lst[-1]}"
+class ModsPage(QWidget):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.kind = "mod"
+        self.source = "modrinth"
+        self.offset = 0
+        self.total = 0
+        self.busy = False
+        self._more_btn = None
 
+        # слева панель фильтров (тип, источник, профиль), справа поиск и результаты — как каталог в 16Launcher
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
+        side = QFrame()
+        side.setProperty("kind", "card")
+        side.setFixedWidth(210)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(12, 12, 12, 12)
+        sl.setSpacing(6)
+        sl.addWidget(label(app, "Тип", "h3"))
+        self.kind_seg = Segment(app, KINDS, self.kind, self.set_kind, vertical=True)
+        sl.addWidget(self.kind_seg)
+        sl.addSpacing(6)
+        sl.addWidget(label(app, "Источник", "h3"))
+        self.src_seg = Segment(app, [("modrinth", "Modrinth"), ("curseforge", "CurseForge")], self.source,
+                               self._set_source, translate=False, vertical=True)
+        sl.addWidget(self.src_seg)
+        sl.addSpacing(6)
+        sl.addWidget(label(app, "Подбор под профиль", "h3"))
+        self.prof = label(app, None, "muted", wrap=True)
+        sl.addWidget(self.prof)
+        sl.addWidget(label(app, "Показываются только моды под версию игры и загрузчик выбранного профиля.", "muted", wrap=True))
+        sl.addStretch(1)
+        sl.addWidget(button(app, "Оптимизация", "ghost", self._optimize))
+        outer.addWidget(side)
 
-def _safe_name(name: str) -> str:
-    base = os.path.basename(str(name).replace("\\", "/"))
-    if not base or base in (".", ".."):
-        raise ValueError("Недопустимое имя файла")
-    return base
+        right = QVBoxLayout()
+        right.setSpacing(10)
+        outer.addLayout(right, 1)
+        row = QHBoxLayout()
+        self.query = QLineEdit()
+        app.bind(self.query, "Поиск...", "placeholder")
+        self.query.returnPressed.connect(self.search)
+        row.addWidget(self.query, 1)
+        row.addWidget(button(app, "Найти", "primary", self.search))
+        right.addLayout(row)
+        self.status = label(app, None, "muted", wrap=True)
+        right.addWidget(self.status)
+        self.scroll = VScroll()
+        right.addWidget(self.scroll, 1)
+        app.profiles_changed.connect(self._profile_changed)
+        app.event.connect(self._event)
+        self._fill_profile()
 
+    # ----- публичное
+    def set_kind(self, kind: str) -> None:
+        self.kind = kind
+        self.kind_seg.select(kind, notify=False)
+        self.search()
 
-def _primary(files):
-    files = files or []
-    return next((f for f in files if f.get("primary")), files[0] if files else None)
+    def search_for(self, query: str) -> None:
+        self.kind = "mod"
+        self.kind_seg.select("mod", notify=False)
+        self.query.setText(query)
+        self.search()
 
+    def on_show(self) -> None:
+        self._fill_profile()
+        if not self.scroll.lay.count():
+            self.search()
 
-# ---------- установка ----------
-def install_modrinth(id_or_slug, mc, loaders, dir_, seen=None, pinned=None) -> list[str]:
-    """Скачивает проект Modrinth и его обязательные зависимости. pinned — уже выбранная версия самого мода."""
-    seen = set() if seen is None else seen
-    if id_or_slug in seen:
-        return []
-    seen.add(id_or_slug)
-    v = pinned
-    if not v:
-        url = f"{MR_BASE}/project/{q(id_or_slug)}/version?game_versions={enc([mc])}"
-        if loaders:
-            url += f"&loaders={enc(loaders)}"
-        versions = util.get_json(url)
-        if not versions:
-            raise NoVersion(f"Нет версии для {mc}")
-        v = next((x for x in versions if x.get("version_type") == "release"), versions[0])
-    f = _primary(v.get("files"))
-    if not f:
-        raise ValueError("У этой версии нет файла")
-    fname = _safe_name(f["filename"])
-    dest = os.path.join(dir_, fname)
-    if not os.path.exists(dest):
-        util.download(f["url"], dest)
-    done = [fname]
-    for d in v.get("dependencies") or []:
-        if d.get("dependency_type") == "required" and d.get("project_id"):
-            try:
-                done.extend(install_modrinth(d["project_id"], mc, loaders, dir_, seen))
-            except Exception:  # noqa: BLE001
-                pass  # зависимость не нашлась — пропускаем
-    return done
+    # ----- внутреннее
+    def _set_source(self, s: str) -> None:
+        self.source = s
+        self.search()
 
+    def _fill_profile(self) -> None:
+        p = self.app.current_profile()
+        self.prof.setText(self.app.t("Профиль: {p}", p=profile_label(p)) if p else self.app.t("Сначала создай профиль на вкладке «Профили»."))
 
-def cf_headers(ctx) -> dict:
-    return {"x-api-key": ctx.settings.get("curseforgeKey", ""), "Accept": "application/json"}
+    def _profile_changed(self) -> None:
+        self._fill_profile()
 
+    def _event(self, ch, p) -> None:
+        if ch == "pack:progress" and isinstance(p, dict) and p.get("text"):
+            self.status.setText(self.app.t(str(p["text"])))
 
-def install_curseforge(ctx, mod_id, mc, loader, dir_, seen=None, file_id=None) -> list[str]:
-    seen = set() if seen is None else seen
-    if mod_id in seen:
-        return []
-    seen.add(mod_id)
-    if file_id:
-        one = util.get_json(f"{CF_BASE}/mods/{mod_id}/files/{file_id}", cf_headers(ctx))
-        f = one and one.get("data")
-        if not f:
-            raise ValueError("Эта версия не найдена на CurseForge")
-    else:
-        qs = f"gameVersion={q(mc)}&pageSize=10"
-        lt = CF_LOADER.get("fabric" if loader == "quilt" else loader)
-        if lt:
-            qs += f"&modLoaderType={lt}"
-        res = util.get_json(f"{CF_BASE}/mods/{mod_id}/files?{qs}", cf_headers(ctx))
-        if not res.get("data"):
-            raise NoVersion(f"Нет файла для {mc}")
-        f = next((x for x in res["data"] if x.get("releaseType") == 1), res["data"][0])
-    fname = _safe_name(f["fileName"])
-    dest = os.path.join(dir_, fname)
-    if not os.path.exists(dest):
-        dl = f.get("downloadUrl") or f"https://www.curseforge.com/api/v1/mods/{mod_id}/files/{f['id']}/download"
-        util.download(dl, dest)
-    done = [fname]
-    for d in f.get("dependencies") or []:
-        if d.get("relationType") == 3:
-            try:
-                done.extend(install_curseforge(ctx, d["modId"], mc, loader, dir_, seen))
-            except Exception:  # noqa: BLE001
-                pass
-    return done
+    def search(self, more: bool = False) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        if not more:
+            self.offset = 0
+            self.scroll.clear()
+        self.status.setText(self.app.t("Ищу..."))
+        p = self.app.current_profile()
+        payload = {"source": self.source, "query": self.query.text().strip(), "kind": self.kind, "offset": self.offset}
+        if p and self.kind != "modpack":
+            payload.update(mc=p["version"], loader=p.get("loader"))
 
+        def ok(r):
+            self.busy = False
+            if not (r or {}).get("ok"):
+                self.status.setText(self.app.t((r or {}).get("error") or "?"))
+                return
+            self.status.setText("")
+            self.total = r.get("total") or 0
+            if self._more_btn is not None:
+                self._more_btn.setParent(None)
+                self._more_btn = None
+            # убрать растяжку в конце перед добавлением
+            items = r.get("items") or []
+            if not items and not more:
+                self.status.setText(self.app.t("Ничего не найдено"))
+            for it in items:
+                self.scroll.lay.addWidget(self._card(it))
+            self.offset += len(items)
+            if items and self.offset < self.total:
+                self._more_btn = button(self.app, "Ещё", "ghost", lambda: self.search(True))
+                self.scroll.lay.addWidget(self._more_btn)
+            self.scroll.lay.addStretch(1)
 
-def cf_find_mod(ctx, name, slug_name, mc, loader):
-    """Ищет мод на CurseForge по названию (только точное совпадение, чтобы не поставить чужое)."""
-    lt = CF_LOADER.get("fabric" if loader == "quilt" else loader)
-    url = (f"{CF_BASE}/mods/search?gameId=432&classId=6&pageSize=10&sortField=2&sortOrder=desc"
-           f"&searchFilter={q(name)}&gameVersion={q(mc)}")
-    if lt:
-        url += f"&modLoaderType={lt}"
-    data = util.get_json(url, cf_headers(ctx))
+        def err(m):
+            self.busy = False
+            self.status.setText(m)
+        self.app.call("mods:search", payload, ok, err)
 
-    def norm(s):
-        return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
-    for m in data.get("data") or []:
-        if norm(m.get("name")) == norm(name) or norm(m.get("slug")) == norm(slug_name):
-            return m
-    return None
+    def _card(self, it: dict) -> QWidget:
+        app = self.app
+        c = Card(layout="h", margins=(12, 10, 12, 10), spacing=12)
+        c.lay.addWidget(RemoteIcon(app, it.get("icon"), 56, it.get("title") or "?"))
+        mid = QVBoxLayout()
+        mid.setSpacing(2)
+        t = QLabel(str(it.get("title") or ""))
+        t.setProperty("kind", "h2")
+        mid.addWidget(t)
+        meta = " · ".join(x for x in [it.get("author"), app.t("{n} загрузок", n=fmt_num(app, it.get("downloads")))] if x)
+        m = QLabel(meta)
+        m.setProperty("kind", "muted")
+        mid.addWidget(m)
+        d = QLabel(str(it.get("description") or "")[:220])
+        d.setWordWrap(True)
+        mid.addWidget(d)
+        c.lay.addLayout(mid, 1)
+        col = QVBoxLayout()
+        col.addWidget(button(app, "Установить", "primary", lambda it=it: self._install(it)))
+        if self.kind != "modpack":
+            col.addWidget(button(app, "Версии", "small", lambda it=it: self._versions(it)))
+        col.addStretch(1)
+        c.lay.addLayout(col)
+        return c
 
+    def _need_profile(self):
+        p = self.app.current_profile()
+        if not p and self.kind != "modpack":
+            self.app.toast("Сначала создай профиль на вкладке «Профили».", "warn")
+        return p
 
-# ---------- иконки ----------
-ICON_HOSTS = [re.compile(r"(^|\.)modrinth\.com$"), re.compile(r"(^|\.)forgecdn\.net$"), re.compile(r"(^|\.)curseforge\.com$")]
-_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif",
-        "image/svg+xml": ".svg", "image/avif": ".avif", "image/bmp": ".bmp"}
+    def _install(self, it: dict, version_id: str | None = None) -> None:
+        if self.kind == "modpack":
+            if version_id is None:
+                return self._pick(it)
+            return self._install_pack(it, version_id)
+        p = self._need_profile()
+        if not p:
+            return
+        payload = {"source": self.source, "id": it["id"], "kind": self.kind, "profileId": p["id"]}
+        if version_id:
+            payload["versionId"] = version_id
+        self.status.setText(self.app.t("Установка..."))
 
+        def ok(r):
+            if not (r or {}).get("ok"):
+                self.status.setText("")
+                return self.app.toast((r or {}).get("error") or "?", "err")
+            self.status.setText("")
+            extra = r.get("extra") or 0
+            self.app.toast(self.app.t("Установлено: {f} (+{n} зависимостей)", f=r.get("filename"), n=extra) if extra
+                           else self.app.t("Установлено: {f}", f=r.get("filename")), "ok")
+            self.app.refresh_profiles()
+        self.app.call("mods:install", payload, ok, lambda m: (self.status.setText(""), self.app.toast(m, "err")))
 
-def _fetch_icon(url: str):
-    status, headers, body = util.request(url, timeout=8, retries=0)
-    ctype = next((v for k, v in headers.items() if k.lower() == "content-type"), "image/png")
-    ctype = ctype.split(";")[0].strip().lower()
-    if not ctype.startswith("image/"):
-        raise ValueError("не картинка")
-    if len(body) > 2 * 1024 * 1024:
-        raise ValueError("слишком большая")
-    return ctype, body
+    def _pick(self, it: dict) -> None:
+        from ..dialogs.versions import pick_version
+        pick_version(self.app, it, self.source, self.kind, lambda vid: self._install(it, vid or ""))
 
+    def _versions(self, it: dict) -> None:
+        if not self._need_profile():
+            return
+        from ..dialogs.versions import pick_version
+        pick_version(self.app, it, self.source, self.kind, lambda vid: self._install(it, vid or ""))
 
-def icon_get(ctx, url):
-    """Возвращает путь к локальному файлу иконки (кэш user_data/icon-cache) или None."""
-    try:
-        u = urllib.parse.urlparse(url)
-        if u.scheme != "https" or not any(r.search(u.hostname or "") for r in ICON_HOSTS):
-            return None
-        cache = os.path.join(ctx.user_data, "icon-cache")
-        key = hashlib.sha1(url.encode("utf-8")).hexdigest()
-        if os.path.isdir(cache):
-            for name in os.listdir(cache):
-                if name.startswith(key + ".") and not name.endswith(".part"):
-                    return os.path.join(cache, name)
-        for route in (url, f"https://wsrv.nl/?url={q(url)}&w=128&h=128&fit=cover"):
-            try:
-                ctype, body = _fetch_icon(route)
-                os.makedirs(cache, exist_ok=True)
-                path = os.path.join(cache, key + _EXT.get(ctype, ".img"))
-                with open(path + ".part", "wb") as f:
-                    f.write(body)
-                os.replace(path + ".part", path)
-                return path
-            except Exception:  # noqa: BLE001
-                continue
-        return None
-    except Exception:  # noqa: BLE001
-        return None
+    def _install_pack(self, it: dict, version_id: str) -> None:
+        self.status.setText(self.app.t("Установка сборки..."))
 
+        def ok(r):
+            if not (r or {}).get("ok"):
+                self.status.setText("")
+                return self.app.toast((r or {}).get("error") or "?", "err")
+            name = (r.get("profile") or {}).get("name") or it.get("title")
+            self.status.setText(self.app.t("Сборка установлена: профиль «{n}»", n=name))
+            self.app.toast(self.app.t("Сборка установлена: профиль «{n}»", n=name), "ok")
+            self.app.refresh_profiles()
+        payload = {"source": self.source, "id": it["id"], "title": it.get("title")}
+        if version_id:
+            payload["versionId"] = version_id
+        self.app.call("pack:install", payload, ok, lambda m: (self.status.setText(""), self.app.toast(m, "err")))
 
-# ---------- оптимизация ----------
-OPT_FABRIC = [
-    ("sodium", "Sodium", "Новый движок отрисовки — главный буст FPS"),
-    ("lithium", "Lithium", "Оптимизация игровой логики и сервера"),
-    ("ferrite-core", "FerriteCore", "Меньше потребление памяти"),
-    ("entityculling", "Entity Culling", "Не рисует мобов, которых не видно"),
-    ("immediatelyfast", "ImmediatelyFast", "Быстрее интерфейс и текст"),
-    ("modernfix", "ModernFix", "Быстрый запуск и меньше памяти"),
-    ("krypton", "Krypton", "Оптимизация сети"),
-    ("dynamic-fps", "Dynamic FPS", "Снижает нагрузку, когда окно не в фокусе"),
-    ("sodium-extra", "Sodium Extra", "Доп. настройки Sodium: облака, анимации, частицы"),
-    ("moreculling", "More Culling", "Ещё больше отсечения невидимых объектов"),
-    ("scalablelux", "ScalableLux", "Быстрое освещение мира"),
-    ("noisium", "Noisium", "Быстрее генерация новых территорий"),
-    ("memoryleakfix", "Memory Leak Fix", "Исправляет утечки памяти"),
-]
-OPT_FORGE = [
-    ("embeddium", "Embeddium", "Движок отрисовки (аналог Sodium) — буст FPS"),
-    ("ferrite-core", "FerriteCore", "Меньше потребление памяти"),
-    ("modernfix", "ModernFix", "Быстрый запуск и меньше памяти"),
-    ("entityculling", "Entity Culling", "Не рисует мобов, которых не видно"),
-    ("immediatelyfast", "ImmediatelyFast", "Быстрее интерфейс и текст"),
-    ("dynamic-fps", "Dynamic FPS", "Снижает нагрузку, когда окно не в фокусе"),
-    ("moreculling", "More Culling", "Ещё больше отсечения невидимых объектов"),
-    ("memoryleakfix", "Memory Leak Fix", "Исправляет утечки памяти"),
-]
+    def _optimize(self) -> None:
+        p = self.app.current_profile()
+        if not p:
+            return self.app.toast("Сначала создай профиль на вкладке «Профили».", "warn")
+        from ..dialogs.optimize import OptimizeDialog
+        OptimizeDialog(self.app, p).exec()
 
+    def retranslate(self) -> None:
+        self._fill_profile()
 
-def opt_list(loader):
-    if loader in ("forge", "neoforge"):
-        return OPT_FORGE
-    if loader in ("fabric", "quilt"):
-        return OPT_FABRIC
-    return []
-
-
-# ---------- обработчики ----------
-def handlers(ctx):
-    def profile_of(pid):
-        return ctx.find_profile(pid or ctx.settings.get("currentProfile"))
-
-    def search(arg=None):
-        arg = arg or {}
-        source, query, mc, loader = arg.get("source"), arg.get("query"), arg.get("mc"), arg.get("loader")
-        kind = arg.get("kind") or "mod"
-        try:
-            offset = int(float(arg.get("offset") or 0))
-        except (TypeError, ValueError):
-            offset = 0
-        try:
-            if source == "modrinth":
-                facets = [[f"project_type:{kind}"]]
-                if mc:
-                    facets.append([f"versions:{mc}"])
-                if kind == "mod" and loader and loader != "vanilla":
-                    facets.append([f"categories:{loader}"])
-                url = (f"{MR_BASE}/search?limit=40&offset={offset}&index={'relevance' if query else 'downloads'}"
-                       f"&query={q(query or '')}&facets={enc(facets)}")
-                data = util.get_json(url)
-                return {"ok": True, "total": data.get("total_hits"),
-                        "items": [{"id": h.get("project_id"), "title": h.get("title"), "description": h.get("description"),
-                                   "icon": h.get("icon_url"), "downloads": h.get("downloads"), "author": h.get("author")}
-                                  for h in data.get("hits", [])]}
-            if not ctx.settings.get("curseforgeKey"):
-                return {"ok": False, "error": NEED_KEY}
-            url = (f"{CF_BASE}/mods/search?gameId=432&classId={CF_CLASS.get(kind, 6)}&pageSize=40&index={offset}"
-                   f"&sortField={2 if query else 6}&sortOrder=desc&searchFilter={q(query or '')}")
-            if mc:
-                url += f"&gameVersion={q(mc)}"
-            if kind == "mod" and CF_LOADER.get(loader):
-                url += f"&modLoaderType={CF_LOADER[loader]}"
-            data = util.get_json(url, cf_headers(ctx))
-            items = []
-            for m in data.get("data", []):
-                authors = m.get("authors") or []
-                items.append({"id": m.get("id"), "title": m.get("name"), "description": m.get("summary"),
-                              "icon": (m.get("logo") or {}).get("thumbnailUrl"), "downloads": m.get("downloadCount"),
-                              "author": authors[0].get("name") if authors else None})
-            return {"ok": True, "total": (data.get("pagination") or {}).get("totalCount"), "items": items}
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": str(e)}
-
-    def versions(arg=None):
-        arg = arg or {}
-        source, id_, kind = arg.get("source"), arg.get("id"), arg.get("kind") or "mod"
-        try:
-            profile = profile_of(arg.get("profileId"))
-            if not profile:
-                return {"ok": False, "error": NEED_PROFILE}
-            mc, loader = profile["version"], profile["loader"]
-            need_loader = kind == "mod" and loader != "vanilla"
-            info = {"version": mc, "loader": loader}
-            if source == "modrinth":
-                if not ok_project_id(id_):
-                    return {"ok": False, "error": "Неверный мод"}
-                want = util.loaders_for(loader)
-                lst = util.get_json(f"{MR_BASE}/project/{q(id_)}/version")
-                items = []
-                for v in lst[:150]:
-                    gv, ld = v.get("game_versions") or [], v.get("loaders") or []
-                    items.append({"id": v.get("id"), "name": v.get("name") or v.get("version_number"),
-                                  "number": v.get("version_number"), "mc": mc_summary(gv), "loaders": ld,
-                                  "type": v.get("version_type") or "release", "date": v.get("date_published"),
-                                  "fit": mc in gv and (not need_loader or any(l in want for l in ld))})
-                return {"ok": True, "profile": info, "items": items}
-            if not ctx.settings.get("curseforgeKey"):
-                return {"ok": False, "error": NEED_KEY}
-            if not ok_cf_number(id_):
-                return {"ok": False, "error": "Неверный мод"}
-            res = util.get_json(f"{CF_BASE}/mods/{int(float(id_))}/files?pageSize=50", cf_headers(ctx))
-            want_cf = ["quilt", "fabric"] if loader == "quilt" else [loader]
-            items = []
-            for f in res.get("data") or []:
-                gv = f.get("gameVersions") or []
-                low = [str(g).lower() for g in gv]
-                mcs = [g for g in gv if re.match(r"^\d", str(g))]
-                rt = f.get("releaseType")
-                items.append({"id": str(f.get("id")), "name": f.get("displayName") or f.get("fileName"),
-                              "mc": mc_summary(mcs),
-                              "loaders": [g for g in low if re.fullmatch(r"fabric|forge|neoforge|quilt", g)],
-                              "type": "release" if rt == 1 else "beta" if rt == 2 else "alpha",
-                              "date": f.get("fileDate"),
-                              "fit": mc in gv and (not need_loader or any(l in low for l in want_cf))})
-            return {"ok": True, "profile": info, "items": items}
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": str(e)}
-
-    def install(arg=None):
-        arg = arg or {}
-        source, id_, kind, version_id = arg.get("source"), arg.get("id"), arg.get("kind") or "mod", arg.get("versionId")
-        try:
-            profile = profile_of(arg.get("profileId"))
-            if not profile:
-                return {"ok": False, "error": NEED_PROFILE}
-            mc, loader = profile["version"], profile["loader"]
-            if version_id:
-                good = (ok_project_id(version_id) and ok_project_id(id_)) if source == "modrinth" \
-                    else (ok_cf_number(version_id) and ok_cf_number(id_))
-                if not good:
-                    return {"ok": False, "error": "Неверная версия"}
-            if kind == "mod" and loader == "vanilla":
-                return {"ok": False, "error": "В профиле выбран Vanilla — моды ставятся только на Fabric, Forge, NeoForge или Quilt. Создай профиль с загрузчиком."}
-            d = os.path.join(ctx.ensure_instance(profile["id"]), KIND_DIR.get(kind, "mods"))
-            os.makedirs(d, exist_ok=True)
-            if source == "modrinth":
-                pinned = None
-                if version_id:
-                    pinned = util.get_json(f"{MR_BASE}/version/{q(version_id)}")
-                    if not pinned or pinned.get("project_id") != id_:
-                        return {"ok": False, "error": "Эта версия не относится к выбранному моду"}
-                files = install_modrinth(id_, mc, util.loaders_for(loader) if kind == "mod" else None, d, set(), pinned)
-                return {"ok": True, "filename": files[0], "extra": len(files) - 1}
-            if not ctx.settings.get("curseforgeKey"):
-                return {"ok": False, "error": NEED_KEY}
-            files = install_curseforge(ctx, id_, mc, loader if kind == "mod" else None, d, set(), version_id or None)
-            return {"ok": True, "filename": files[0], "extra": len(files) - 1}
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": str(e)}
-
-    def icon(url=None):
-        return icon_get(ctx, url) if isinstance(url, str) else None
-
-    def opt_list_h(loader=None):
-        return [{"slug": s, "name": n, "desc": d} for s, n, d in opt_list(loader)]
-
-    def opt_install(arg=None):
-        arg = arg or {}
-        profile = profile_of(arg.get("profileId"))
-        if not profile:
-            return {"ok": False, "error": NEED_PROFILE}
-        mc, loader = profile["version"], profile["loader"]
-        lst = opt_list(loader)
-        if not lst:
-            return {"ok": False, "error": "Для Vanilla оптимизация модами недоступна — создай профиль с Fabric, Forge, NeoForge или Quilt."}
-        d = os.path.join(ctx.ensure_instance(profile["id"]), "mods")
-        seen_mr, seen_cf = set(), set()
-        stats = {"installed": 0, "skipped": 0, "failed": 0, "needKey": 0, "bySource": {"modrinth": 0, "curseforge": 0}}
-        key = ctx.settings.get("curseforgeKey")
-        for slug_name, name, _desc in lst:
-            ctx.send("opt:progress", {"slug": slug_name, "status": "loading"})
-            source = file = mr_err = cf_err = None
-            try:
-                files = install_modrinth(slug_name, mc, util.loaders_for(loader), d, seen_mr)
-                source, file = "Modrinth", files[0] if files else None
-            except Exception as e:  # noqa: BLE001
-                mr_err = e
-            if not source and key:
-                try:
-                    m = cf_find_mod(ctx, name, slug_name, mc, loader)
-                    if not m:
-                        raise NoVersion("не найден на CurseForge")
-                    files = install_curseforge(ctx, m["id"], mc, loader, d, seen_cf)
-                    source, file = "CurseForge", files[0] if files else None
-                except Exception as e:  # noqa: BLE001
-                    cf_err = e
-            if source:
-                stats["installed"] += 1
-                stats["bySource"]["modrinth" if source == "Modrinth" else "curseforge"] += 1
-                ctx.send("opt:progress", {"slug": slug_name, "status": "ok", "detail": file, "source": source})
-                continue
-            if not key:
-                stats["needKey"] += 1
-            real = next((e for e in (mr_err, cf_err) if e is not None and getattr(e, "code", None) != "NO_VERSION"), None)
-            if real is not None:
-                stats["failed"] += 1
-                ctx.send("opt:progress", {"slug": slug_name, "status": "fail", "detail": str(real)})
-            else:
-                stats["skipped"] += 1
-                ctx.send("opt:progress", {"slug": slug_name, "status": "skip", "detail": f"Нет версии для {mc}"})
-        return {"ok": True, **stats}
-
-    return {"mods:search": search, "mods:versions": versions, "mods:install": install, "icon:get": icon,
-            "opt:list": opt_list_h, "opt:install": opt_install}
+    def selftest(self) -> None:
+        from ..dialogs.optimize import OptimizeDialog
+        p = self.app.current_profile()
+        if p:
+            OptimizeDialog(self.app, p)

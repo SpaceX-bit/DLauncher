@@ -1,187 +1,288 @@
-"""Скины и плащи аккаунта Microsoft. Порт lib/skins.js.
-Картинки отдаём локальными путями (кеш user_data/skin-cache) вместо data:-адресов."""
+"""Вкладка «Скины»: скин и плащи аккаунта Microsoft, предпросмотр спереди/сзади (рисуем из текстуры скина)."""
 from __future__ import annotations
 
-import json
-import os
-import re
-import secrets
-import struct
-import urllib.parse
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from . import util
+from .. import i18n, theme
+from ..dialogs.shared import Segment
+from ..widgets import Card, VScroll, button, label
 
-API = "https://api.minecraftservices.com/minecraft/profile"
-PNG_SIG = b"\x89PNG\r\n\x1a\n"
-MAX_SKIN = 100 * 1024
-MAX_CAPE = 300 * 1024
+i18n.register({
+    "Скины": "Skins",
+    "Скин аккаунта": "Account skin",
+    "Выбрать файл скина": "Choose a skin file",
+    "Применить": "Apply",
+    "Отмена": "Cancel",
+    "Повернуть": "Turn around",
+    "Вернуть стандартный": "Reset to default",
+    "Классический": "Classic",
+    "Тонкие руки": "Slim arms",
+    "Плащи": "Capes",
+    "Надеть": "Wear",
+    "Снять плащ": "Take off the cape",
+    "Надет": "Worn",
+    "Аккаунт: {n}": "Account: {n}",
+    "Скин выбран: {n}. Нажми «Применить».": "Skin chosen: {n}. Press “Apply”.",
+    "Старый формат скина (64×32) — он отобразится в игре без второго слоя.": "Old skin format (64×32) — it will show without the second layer.",
+    "Скин применён": "Skin applied",
+    "Загрузка...": "Loading...",
+    "Нет плащей": "No capes",
+    "Вернуть стандартный скин?": "Reset to the default skin?",
+})
 
 
-def png_size(buf: bytes):
-    if not isinstance(buf, (bytes, bytearray)) or len(buf) < 24 or bytes(buf[:8]) != PNG_SIG:
-        return None
-    w, h = struct.unpack(">II", bytes(buf[16:24]))
-    return {"width": w, "height": h}
+def skin_parts(legacy: bool, slim: bool, back: bool) -> list[dict]:
+    """Какие куски текстуры куда рисовать (в «пикселях персонажа»: 16×32).
+    Возвращает [{'src': (x,y,w,h), 'dst': (x,y,w,h), 'flip': bool, 'over': bool}] в порядке рисования."""
+    aw = 3 if slim else 4
+    parts: list[dict] = []
+
+    def add(src, dst, flip=False, over=False):
+        parts.append({"src": src, "dst": dst, "flip": flip, "over": over})
+
+    # голова и тело (одинаково у старого и нового формата)
+    add((24, 8, 8, 8) if back else (8, 8, 8, 8), (4, 0, 8, 8))
+    add((32, 20, 8, 12) if back else (20, 20, 8, 12), (4, 8, 8, 12))
+    # правая рука (персонажа): спереди слева, сзади справа
+    r_front = (44, 20, aw, 12)
+    r_back = ((51 if slim else 52), 20, aw, 12)
+    r_src = r_back if back else r_front
+    r_dst = (12, 8, aw, 12) if back else (4 - aw, 8, aw, 12)
+    # левая рука: у нового формата своя текстура, у старого — отражённая правая
+    if legacy:
+        l_src, l_flip = r_src, True
+    else:
+        l_src = ((43 if slim else 44), 52, aw, 12) if back else (36, 52, aw, 12)
+        l_flip = False
+    l_dst = (4 - aw, 8, aw, 12) if back else (12, 8, aw, 12)
+    add(r_src, r_dst)
+    add(l_src, l_dst, l_flip)
+    # ноги
+    rl_src = (12, 20, 4, 12) if back else (4, 20, 4, 12)
+    ll_src, ll_flip = ((rl_src, True) if legacy else (((28, 52, 4, 12) if back else (20, 52, 4, 12)), False))
+    add(rl_src, (8, 20, 4, 12) if back else (4, 20, 4, 12))
+    add(ll_src, (4, 20, 4, 12) if back else (8, 20, 4, 12), ll_flip)
+    if not legacy:  # второй слой
+        add((56, 8, 8, 8) if back else (40, 8, 8, 8), (4, 0, 8, 8), over=True)
+        add((32, 36, 8, 12) if back else (20, 36, 8, 12), (4, 8, 8, 12), over=True)
+        add(((51 if slim else 52), 36, aw, 12) if back else (44, 36, aw, 12), r_dst, over=True)
+        add(((59 if slim else 60), 52, aw, 12) if back else (52, 52, aw, 12), l_dst, over=True)
+        add((12, 36, 4, 12) if back else (4, 36, 4, 12), (8, 20, 4, 12) if back else (4, 20, 4, 12), over=True)
+        add((12, 52, 4, 12) if back else (4, 52, 4, 12), (4, 20, 4, 12) if back else (8, 20, 4, 12), over=True)
+    return parts
 
 
-class _Soft(Exception):
-    soft = True
+def cape_front_rect() -> tuple[int, int, int, int]:
+    return (1, 1, 10, 16)
 
 
-def handlers(ctx):
-    state = {"pending": None}
-    cache_dir = os.path.join(ctx.user_data, "skin-cache")
+class SkinPreview(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(200, 340)
+        self.image: QImage | None = None
+        self.slim = False
+        self.back = False
 
-    def req(url, method="GET", headers=None, body=None):
-        """-> (status, bytes). Ошибки HTTP не бросают исключение."""
-        try:
-            st, _h, data = util.request(url, method, headers, body, timeout=15, retries=0)
-            return st, data
-        except util.HttpError as e:
-            return e.status, e.data or b""
+    def set_skin(self, path: str | None, slim: bool) -> None:
+        self.image = QImage(path) if path else None
+        if self.image is not None and self.image.isNull():
+            self.image = None
+        self.slim = slim
+        self.update()
 
-    def authed():
-        if ctx.settings.get("accountMode") != "microsoft":
-            raise _Soft("Скины можно менять только у аккаунта Microsoft: включи режим Microsoft в Настройках.")
-        a = ctx.msauth.get_launch_auth()
-        return {"Authorization": f"Bearer {a['access_token']}"}
+    def paintEvent(self, _):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        if self.image is None:
+            p.setPen(QColor(theme.MUTED))
+            p.drawText(self.rect(), Qt.AlignCenter, "?")
+            p.end()
+            return
+        legacy = self.image.height() < 64
+        scale = max(1, min(self.width() // 16, self.height() // 32))
+        ox = (self.width() - 16 * scale) // 2
+        oy = (self.height() - 32 * scale) // 2
+        for part in skin_parts(legacy, self.slim, self.back):
+            sx, sy, sw, sh = part["src"]
+            dx, dy, dw, dh = part["dst"]
+            piece = self.image.copy(QRect(sx, sy, sw, sh))
+            if part["flip"]:
+                piece = piece.mirrored(True, False)
+            p.drawImage(QRect(ox + dx * scale, oy + dy * scale, dw * scale, dh * scale), piece)
+        p.end()
 
-    def explain(status):
-        if status in (401, 403):
-            return "Сессия Microsoft истекла: войди заново в Настройках."
-        if status == 429:
-            return "Слишком много запросов. Подожди минуту и попробуй снова."
-        if status == 400:
-            return "Mojang не принял файл: нужен PNG 64×64 (или 64×32)."
-        return f"Ошибка сервера Mojang ({status})."
 
-    def fetch_texture(url, limit):
-        try:
-            u = urllib.parse.urlparse(re.sub(r"^http://", "https://", str(url), flags=re.I))
-        except ValueError:
-            return None
-        if u.scheme != "https" or u.hostname != "textures.minecraft.net":
-            return None
-        st, data = req(u.geturl())
-        if st != 200 or len(data) > limit or not png_size(data):
-            return None
-        return data
+class SkinsPage(QWidget):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.state: dict | None = None
+        self.pending = False
+        self.variant = "classic"
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(10)
+        outer.addWidget(label(app, "Скины", "h2"))
+        root = QHBoxLayout()
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(16)
+        outer.addLayout(root, 1)
 
-    def save_image(data: bytes, prefix: str):
-        os.makedirs(cache_dir, exist_ok=True)
-        p = os.path.join(cache_dir, f"{prefix}-{util.sha1_bytes(data)[:16]}.png")
-        if not os.path.exists(p):
-            with open(p, "wb") as f:
-                f.write(data)
-        return p
+        left = Card()
+        left.setMinimumWidth(300)
+        left.lay.addWidget(label(app, "Скин аккаунта", "h3"))
+        self.acc = label(app, None, "muted", wrap=True)
+        left.lay.addWidget(self.acc)
+        self.preview = SkinPreview()
+        left.lay.addWidget(self.preview, 1)
+        left.lay.addWidget(button(app, "Повернуть", "small", self._turn))
+        self.seg = Segment(app, [("classic", "Классический"), ("slim", "Тонкие руки")], "classic", self._variant)
+        left.lay.addWidget(self.seg)
+        self.msg = label(app, None, "muted", wrap=True)
+        left.lay.addWidget(self.msg)
+        row = QHBoxLayout()
+        self.btn_choose = button(app, "Выбрать файл скина", "ghost", self._choose)
+        self.btn_apply = button(app, "Применить", "primary", self._apply)
+        self.btn_cancel = button(app, "Отмена", "ghost", self._discard)
+        row.addWidget(self.btn_choose)
+        row.addWidget(self.btn_apply)
+        row.addWidget(self.btn_cancel)
+        left.lay.addLayout(row)
+        self.btn_reset = button(app, "Вернуть стандартный", "danger", self._reset)
+        left.lay.addWidget(self.btn_reset)
+        root.addWidget(left, 2)
 
-    def current():
-        headers = authed()
-        st, data = req(API, headers=headers)
-        if st != 200:
-            raise RuntimeError(explain(st))
-        j = json.loads(data.decode("utf-8"))
-        skins = j.get("skins") or []
-        skin = next((s for s in skins if s.get("state") == "ACTIVE"), None) or (skins[0] if skins else None)
-        skin_image = None
-        if skin and skin.get("url"):
-            try:
-                b = fetch_texture(skin["url"], MAX_SKIN)
-                if b:
-                    skin_image = save_image(b, "skin")
-            except Exception:  # noqa: BLE001
-                pass
-        capes = []
-        for c in j.get("capes") or []:
-            image = None
-            try:
-                b = fetch_texture(c["url"], MAX_CAPE) if c.get("url") else None
-                if b:
-                    image = save_image(b, "cape")
-            except Exception:  # noqa: BLE001
-                pass
-            capes.append({"id": str(c.get("id")), "name": str(c.get("alias") or "Cape")[:40],
-                          "active": c.get("state") == "ACTIVE", "image": image})
-        return {"ok": True, "name": j.get("name"), "uuid": j.get("id"), "skin": skin_image,
-                "variant": "slim" if skin and str(skin.get("variant")).upper() == "SLIM" else "classic", "capes": capes}
+        right = VScroll()
+        root.addWidget(right, 3)
+        self.capes_card = Card()
+        self.capes_card.lay.addWidget(label(app, "Плащи", "h3"))
+        self.capes_box = QVBoxLayout()
+        self.capes_card.lay.addLayout(self.capes_box)
+        right.lay.addWidget(self.capes_card)
+        right.lay.addStretch(1)
+        self._sync_buttons()
 
-    def fail(e):
-        return {"ok": False, "error": str(e), "soft": bool(getattr(e, "soft", False))}
+    def on_show(self) -> None:
+        self.load()
 
-    def s_get(_=None):
-        try:
-            return current()
-        except Exception as e:  # noqa: BLE001
-            return fail(e)
+    def load(self) -> None:
+        self.msg.setText(self.app.t("Загрузка..."))
+        self.app.call("skins:get", None, self._got, lambda m: self.msg.setText(m))
 
-    def s_choose(_=None):
-        try:
-            en = ctx.settings.get("lang") == "en"
-            f = ctx.ui.open_file("Choose a skin file (PNG 64×64)" if en else "Выбери файл скина (PNG 64×64)", [("PNG", ["png"])])
-            if not f:
-                return {"ok": False, "canceled": True}
-            if os.path.getsize(f) > MAX_SKIN:
-                return {"ok": False, "error": "Файл слишком большой для скина (больше 100 КБ)."}
-            with open(f, "rb") as fh:
-                buf = fh.read()
-            size = png_size(buf)
-            if not size:
-                return {"ok": False, "error": "Это не PNG-картинка."}
-            if not (size["width"] == 64 and size["height"] in (64, 32)):
-                return {"ok": False, "error": f"Размер скина должен быть 64×64 (или 64×32), а у файла {size['width']}×{size['height']}."}
-            state["pending"] = {"buf": buf, "name": os.path.basename(f)[:60]}
-            return {"ok": True, "name": state["pending"]["name"], "image": save_image(buf, "pending"), "legacy": size["height"] == 32}
-        except Exception as e:  # noqa: BLE001
-            return fail(e)
+    def _got(self, r) -> None:
+        if not isinstance(r, dict):
+            return
+        if not r.get("ok"):
+            self.state = None
+            self.msg.setText(self.app.t(r.get("error") or "?"))
+            self.acc.setText("")
+            self.preview.set_skin(None, False)
+            self._fill_capes([])
+            self._sync_buttons()
+            return
+        self.state = r
+        self.pending = False
+        self.variant = r.get("variant") or "classic"
+        self.seg.select(self.variant, notify=False)
+        self.acc.setText(self.app.t("Аккаунт: {n}", n=r.get("name")))
+        self.preview.set_skin(r.get("skin"), self.variant == "slim")
+        self.msg.setText("")
+        self._fill_capes(r.get("capes") or [])
+        self._sync_buttons()
 
-    def s_apply(arg=None):
-        try:
-            pend = state["pending"]
-            if not pend:
-                return {"ok": False, "error": "Сначала выбери файл скина."}
-            headers = authed()
-            variant = "slim" if (arg or {}).get("variant") == "slim" else "classic"
-            boundary = "----dl" + secrets.token_hex(12)
-            body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"variant\"\r\n\r\n{variant}\r\n"
-                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"skin.png\"\r\n"
-                    f"Content-Type: image/png\r\n\r\n").encode() + pend["buf"] + f"\r\n--{boundary}--\r\n".encode()
-            st, _ = req(f"{API}/skins", "POST", {**headers, "Content-Type": f"multipart/form-data; boundary={boundary}"}, body)
-            if st not in (200, 204):
-                return {"ok": False, "error": explain(st)}
-            state["pending"] = None
-            return current()
-        except Exception as e:  # noqa: BLE001
-            return fail(e)
+    def _sync_buttons(self) -> None:
+        ok = self.state is not None
+        self.btn_choose.setEnabled(ok)
+        self.btn_reset.setEnabled(ok and not self.pending)
+        self.btn_apply.setVisible(self.pending)
+        self.btn_cancel.setVisible(self.pending)
 
-    def s_reset(_=None):
-        try:
-            st, _ = req(f"{API}/skins/active", "DELETE", authed())
-            if st not in (200, 204):
-                return {"ok": False, "error": explain(st)}
-            return current()
-        except Exception as e:  # noqa: BLE001
-            return fail(e)
-
-    def s_cape(arg=None):
-        try:
-            headers = authed()
-            cid = (arg or {}).get("id")
-            if cid:
-                if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", str(cid)):
-                    return {"ok": False, "error": "Неверный плащ."}
-                st, _ = req(f"{API}/capes/active", "PUT", {**headers, "Content-Type": "application/json"},
-                            json.dumps({"capeId": str(cid)}).encode())
+    def _fill_capes(self, capes: list) -> None:
+        from ..widgets import clear_layout
+        clear_layout(self.capes_box)
+        if not capes:
+            self.capes_box.addWidget(label(self.app, "Нет плащей", "muted"))
+            return
+        for c in capes:
+            row = QHBoxLayout()
+            thumb = QLabel()
+            thumb.setFixedSize(40, 64)
+            if c.get("image"):
+                img = QImage(c["image"])
+                if not img.isNull():
+                    x, y, w, h = cape_front_rect()
+                    thumb.setPixmap(QPixmap.fromImage(img.copy(QRect(x, y, w, h))).scaled(40, 64, Qt.KeepAspectRatio, Qt.FastTransformation))
+            row.addWidget(thumb)
+            nm = QLabel(str(c.get("name") or "Cape"))
+            nm.setProperty("kind", "accent" if c.get("active") else "")
+            row.addWidget(nm, 1)
+            if c.get("active"):
+                row.addWidget(label(self.app, "Надет", "ok"))
             else:
-                st, _ = req(f"{API}/capes/active", "DELETE", headers)
-            if st not in (200, 204):
-                return {"ok": False, "error": explain(st)}
-            return current()
-        except Exception as e:  # noqa: BLE001
-            return fail(e)
+                row.addWidget(button(self.app, "Надеть", "small", lambda cid=c["id"]: self._cape(cid)))
+            w = QWidget()
+            w.setLayout(row)
+            self.capes_box.addWidget(w)
+        if any(c.get("active") for c in capes):
+            self.capes_box.addWidget(button(self.app, "Снять плащ", "ghost", lambda: self._cape("")))
 
-    def s_discard(_=None):
-        state["pending"] = None
-        return {"ok": True}
+    # ----- действия
+    def _turn(self) -> None:
+        self.preview.back = not self.preview.back
+        self.preview.update()
 
-    return {"skins:get": s_get, "skins:choose": s_choose, "skins:apply": s_apply, "skins:reset": s_reset,
-            "skins:cape": s_cape, "skins:discard": s_discard}
+    def _variant(self, v: str) -> None:
+        self.variant = v
+        self.preview.slim = v == "slim"
+        self.preview.update()
+
+    def _choose(self) -> None:
+        def ok(r):
+            if (r or {}).get("canceled"):
+                return
+            if not (r or {}).get("ok"):
+                return self.app.toast((r or {}).get("error") or "?", "err")
+            self.pending = True
+            self.preview.set_skin(r.get("image"), self.variant == "slim")
+            self.msg.setText(self.app.t("Скин выбран: {n}. Нажми «Применить».", n=r.get("name")) +
+                             ("\n" + self.app.t("Старый формат скина (64×32) — он отобразится в игре без второго слоя.") if r.get("legacy") else ""))
+            self._sync_buttons()
+        self.app.call("skins:choose", None, ok, lambda m: self.app.toast(m, "err"))
+
+    def _apply(self) -> None:
+        def ok(r):
+            if (r or {}).get("ok"):
+                self._got(r)
+                self.app.toast("Скин применён", "ok")
+            else:
+                self.app.toast((r or {}).get("error") or "?", "err")
+        self.app.call("skins:apply", {"variant": self.variant}, ok, lambda m: self.app.toast(m, "err"))
+
+    def _discard(self) -> None:
+        self.app.call("skins:discard", None, lambda r: self.load(), lambda m: None)
+
+    def _reset(self) -> None:
+        if self.app.confirm("Вернуть стандартный скин?", "Вернуть стандартный", danger=True):
+            self.app.call("skins:reset", None, self._after, lambda m: self.app.toast(m, "err"))
+
+    def _cape(self, cid: str) -> None:
+        self.app.call("skins:cape", {"id": cid}, self._after, lambda m: self.app.toast(m, "err"))
+
+    def _after(self, r) -> None:
+        if (r or {}).get("ok"):
+            self._got(r)
+        else:
+            self.app.toast((r or {}).get("error") or "?", "err")
+
+    def retranslate(self) -> None:
+        if self.state:
+            self._got(self.state)
+
+    def selftest(self) -> None:
+        for legacy in (False, True):
+            for slim in (False, True):
+                for back in (False, True):
+                    assert skin_parts(legacy, slim, back)
